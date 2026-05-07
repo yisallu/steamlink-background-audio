@@ -1,0 +1,25 @@
+name: Build
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build BackgroundAudio.dylib
+        run: |
+          xcrun -sdk iphoneos clang -arch arm64 -shared -fobjc-arc -O2 \
+            -miphoneos-version-min=14.0 \
+            -framework Foundation -framework AVFoundation -framework UIKit \
+            -framework MediaPlayer \
+            -o BackgroundAudio.dylib BackgroundAudio.m
+
+      - name: Upload dylib
+        uses: actions/upload-artifact@v4
+        with:
+          name: BackgroundAudio.dylib
+          path: BackgroundAudio.dylib
