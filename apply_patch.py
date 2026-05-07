@@ -1,11 +1,4 @@
-"""
-Steam Link Background Audio Patch
-Patches a decrypted Steam Link IPA to keep audio playing in background/lock screen.
-
-Usage:
-    python apply_patch.py --input Steamlink.ipa --output Steamlink_patched.ipa [--dylib BackgroundAudio.dylib]
-"""
-import struct, plistlib, shutil, zipfile, os, argparse, tempfile, re
+import struct, plistlib, shutil, zipfile, os, argparse, tempfile
 
 RET = struct.pack('<I', 0xd65f03c0)
 
@@ -32,8 +25,8 @@ def find_sdl_symbols(sdl):
         offset += cmdsize
 
     targets = {}
-    wanted = [b'_SDL_OnApplicationDidEnterBackground', b'_SDL_OnApplicationWillEnterBackground',
-              b'_SDL_PauseAudioDevice', b'_SDL_AudioDevicePaused']
+    # Only patch background-related functions, NOT SDL_PauseAudioDevice
+    wanted = [b'_SDL_OnApplicationDidEnterBackground', b'_SDL_OnApplicationWillEnterBackground']
     for i in range(symtab_nsyms):
         entry = symtab_off + i * 16
         n_strx = struct.unpack_from('<I', sdl, entry)[0]
@@ -42,17 +35,6 @@ def find_sdl_symbols(sdl):
         name = bytes(sdl[strtab_off + n_strx:end])
         if name in wanted:
             targets[name.decode()] = n_value
-
-    # Find audioSessionInterruption: IMP via method list
-    sel = b'audioSessionInterruption:\x00'
-    sel_pos = sdl.find(sel)
-    if sel_pos != -1:
-        for i in range(data_fileoff, min(len(sdl)-24, data_fileoff + data_filesize), 8):
-            if struct.unpack_from('<Q', sdl, i)[0] == sel_pos:
-                imp = struct.unpack_from('<Q', sdl, i+16)[0]
-                if 0 < imp < data_fileoff:
-                    targets['audioSessionInterruption:'] = imp
-                    break
 
     return targets, data_fileoff
 
@@ -64,13 +46,11 @@ def patch_category_refs(sdl):
     playback_pos = sdl.find(b'AVAudioSessionCategoryPlayback\x00')
 
     if ambient_pos == -1 or playback_pos == -1:
-        print('  WARNING: Category strings not found')
         return 0
 
     amb_page = ambient_pos & ~0xFFF
     play_page = playback_pos & ~0xFFF
     if amb_page != play_page:
-        print('  WARNING: Category strings on different pages, skipping')
         return 0
 
     target_page = amb_page
@@ -78,17 +58,14 @@ def patch_category_refs(sdl):
     solo_off = solo_pos & 0xFFF if solo_pos != -1 else -1
     play_off = playback_pos & 0xFFF
 
-    # Find __TEXT size
     ncmds = struct.unpack_from('<I', sdl, 16)[0]
     offset = 32
     text_size = len(sdl)
     for _ in range(ncmds):
         cmd = struct.unpack_from('<I', sdl, offset)[0]
         cmdsize = struct.unpack_from('<I', sdl, offset+4)[0]
-        if cmd == 0x19:
-            segname = sdl[offset+8:offset+24].split(b'\x00')[0]
-            if segname == b'__TEXT':
-                text_size = struct.unpack_from('<Q', sdl, offset+48)[0]
+        if cmd == 0x19 and sdl[offset+8:offset+24].split(b'\x00')[0] == b'__TEXT':
+            text_size = struct.unpack_from('<Q', sdl, offset+48)[0]
         offset += cmdsize
 
     count = 0
@@ -140,33 +117,21 @@ def main():
     parser.add_argument('--dylib', '-d', default=None, help='Path to BackgroundAudio.dylib')
     args = parser.parse_args()
 
-    # Extract IPA
     tmp = tempfile.mkdtemp()
     print(f'Extracting {args.input}...')
     with zipfile.ZipFile(args.input, 'r') as zf:
         zf.extractall(tmp)
 
-    # Find .app directory
     payload = os.path.join(tmp, 'Payload')
-    app_dir = None
-    for item in os.listdir(payload):
-        if item.endswith('.app'):
-            app_dir = os.path.join(payload, item)
-            break
-    if not app_dir:
-        print('ERROR: No .app found in Payload/')
-        return
+    app_dir = next(os.path.join(payload, d) for d in os.listdir(payload) if d.endswith('.app'))
 
     sdl_path = os.path.join(app_dir, 'Frameworks', 'SDL3.framework', 'SDL3')
     plist_path = os.path.join(app_dir, 'Info.plist')
-
-    # Find main executable
     with open(plist_path, 'rb') as f:
         plist = plistlib.load(f)
-    exe_name = plist['CFBundleExecutable']
-    main_path = os.path.join(app_dir, exe_name)
+    main_path = os.path.join(app_dir, plist['CFBundleExecutable'])
 
-    # === Patch SDL3 ===
+    # Patch SDL3
     print('\n=== Patching SDL3 ===')
     with open(sdl_path, 'rb') as f:
         sdl = bytearray(f.read())
@@ -182,7 +147,7 @@ def main():
     with open(sdl_path, 'wb') as f:
         f.write(sdl)
 
-    # === Patch Info.plist ===
+    # Patch Info.plist
     print('\n=== Patching Info.plist ===')
     plist['UIBackgroundModes'] = ['audio']
     plist.pop('UISupportedDevices', None)
@@ -190,37 +155,31 @@ def main():
         plistlib.dump(plist, f)
     print('  Added UIBackgroundModes: audio')
 
-    # === Inject dylib ===
+    # Inject dylib
     if args.dylib and os.path.exists(args.dylib):
         print('\n=== Injecting dylib ===')
-        dst = os.path.join(app_dir, 'Frameworks', 'BackgroundAudio.dylib')
-        shutil.copy2(args.dylib, dst)
-
+        shutil.copy2(args.dylib, os.path.join(app_dir, 'Frameworks', 'BackgroundAudio.dylib'))
         with open(main_path, 'rb') as f:
-            main = bytearray(f.read())
-        new_ncmds = inject_dylib(main)
+            main_bin = bytearray(f.read())
+        new_ncmds = inject_dylib(main_bin)
         with open(main_path, 'wb') as f:
-            f.write(main)
+            f.write(main_bin)
         print(f'  Injected (ncmds -> {new_ncmds})')
 
-    # === Remove signatures ===
+    # Remove signatures
     for d in ['_CodeSignature', 'SC_Info']:
         p = os.path.join(app_dir, d)
         if os.path.exists(p):
             shutil.rmtree(p)
 
-    # === Package IPA ===
+    # Package
     print(f'\n=== Packaging {args.output} ===')
     with zipfile.ZipFile(args.output, 'w', zipfile.ZIP_DEFLATED) as zf:
         for root, dirs, files in os.walk(tmp):
             for f in files:
                 full = os.path.join(root, f)
-                arcname = os.path.relpath(full, tmp)
-                zf.write(full, arcname)
-
-    size_mb = os.path.getsize(args.output) / 1024 / 1024
-    print(f'  Done! ({size_mb:.1f} MB)')
-
+                zf.write(full, os.path.relpath(full, tmp))
+    print(f'  Done! ({os.path.getsize(args.output)/1024/1024:.1f} MB)')
     shutil.rmtree(tmp)
 
 

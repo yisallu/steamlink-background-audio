@@ -1,8 +1,7 @@
-// BackgroundAudio.m - Steam Link Background Audio Tweak v7
+// BackgroundAudio.m - Steam Link Background Audio Tweak v8
 //
-// Nuclear option: swizzle AVAudioSession's setCategory methods to ALWAYS
-// force Playback category, regardless of what SDL or the app requests.
-// Also register MPNowPlayingInfoCenter.
+// - Keeps audio alive on lock screen and background
+// - Fixes AirPods auto-switch: re-activates audio session when interruption ends
 
 #import <Foundation/Foundation.h>
 #import <AVFoundation/AVFoundation.h>
@@ -15,21 +14,20 @@
 #define SDL_EVENT_DID_ENTER_BACKGROUND  0x103
 
 typedef void (*SDL_SetEventEnabled_t)(uint32_t type, int enabled);
+typedef int (*SDL_SetHint_t)(const char *name, const char *value);
+typedef int (*SDL_ResumeAudioDevice_t)(uint32_t devid);
 
 static IMP orig_setCategory1 = NULL;
 static IMP orig_setCategory2 = NULL;
 static IMP orig_setCategory3 = NULL;
 
-// Force all setCategory calls to use Playback
 static BOOL forced_setCategory_error(id self, SEL _cmd, AVAudioSessionCategory cat, NSError **err) {
-    NSLog(@"[BGAudio] setCategory:%@ -> forcing Playback", cat);
     return ((BOOL(*)(id,SEL,AVAudioSessionCategory,NSError**))orig_setCategory1)(
         self, _cmd, AVAudioSessionCategoryPlayback, err);
 }
 
 static BOOL forced_setCategory_options_error(id self, SEL _cmd, AVAudioSessionCategory cat,
                                               AVAudioSessionCategoryOptions opts, NSError **err) {
-    NSLog(@"[BGAudio] setCategory:%@ options:%lu -> forcing Playback", cat, (unsigned long)opts);
     return ((BOOL(*)(id,SEL,AVAudioSessionCategory,AVAudioSessionCategoryOptions,NSError**))orig_setCategory2)(
         self, _cmd, AVAudioSessionCategoryPlayback, 0, err);
 }
@@ -37,7 +35,6 @@ static BOOL forced_setCategory_options_error(id self, SEL _cmd, AVAudioSessionCa
 static BOOL forced_setCategory_mode_options_error(id self, SEL _cmd, AVAudioSessionCategory cat,
                                                    AVAudioSessionMode mode,
                                                    AVAudioSessionCategoryOptions opts, NSError **err) {
-    NSLog(@"[BGAudio] setCategory:%@ mode:%@ options:%lu -> forcing Playback", cat, mode, (unsigned long)opts);
     return ((BOOL(*)(id,SEL,AVAudioSessionCategory,AVAudioSessionMode,AVAudioSessionCategoryOptions,NSError**))orig_setCategory3)(
         self, _cmd, AVAudioSessionCategoryPlayback, mode, 0, err);
 }
@@ -60,50 +57,78 @@ static void registerNowPlaying(void) {
     }];
 }
 
+static void reactivateAudio(void) {
+    AVAudioSession *session = [AVAudioSession sharedInstance];
+    NSError *err = nil;
+    [session setActive:NO withOptions:AVAudioSessionSetActiveOptionNotifyOthersOnDeactivation error:nil];
+    [session setCategory:AVAudioSessionCategoryPlayback error:nil];
+    [session setActive:YES error:&err];
+    if (err) {
+        NSLog(@"[BGAudio] reactivate error: %@, retrying...", err);
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+            [[AVAudioSession sharedInstance] setActive:YES error:nil];
+        });
+    }
+
+    // Resume SDL audio device (device ID 1 is typically the default output)
+    SDL_ResumeAudioDevice_t resume = (SDL_ResumeAudioDevice_t)dlsym(RTLD_DEFAULT, "SDL_ResumeAudioDevice");
+    if (resume) {
+        // SDL3 uses device IDs starting from 1; try common IDs
+        resume(1);
+        resume(2);
+        NSLog(@"[BGAudio] SDL_ResumeAudioDevice called");
+    }
+}
+
 __attribute__((constructor))
 static void bgaudio_init(void) {
     @autoreleasepool {
-        NSLog(@"[BGAudio] === v7 loaded ===");
+        NSLog(@"[BGAudio] === v8 loaded ===");
 
-        // 1. Swizzle ALL AVAudioSession setCategory: variants
-        Class sessionClass = [AVAudioSession class];
+        // Swizzle AVAudioSession setCategory
+        Class sc = [AVAudioSession class];
+        Method m1 = class_getInstanceMethod(sc, @selector(setCategory:error:));
+        Method m2 = class_getInstanceMethod(sc, @selector(setCategory:withOptions:error:));
+        Method m3 = class_getInstanceMethod(sc, @selector(setCategory:mode:options:error:));
+        if (m1) orig_setCategory1 = method_setImplementation(m1, (IMP)forced_setCategory_error);
+        if (m2) orig_setCategory2 = method_setImplementation(m2, (IMP)forced_setCategory_options_error);
+        if (m3) orig_setCategory3 = method_setImplementation(m3, (IMP)forced_setCategory_mode_options_error);
 
-        Method m1 = class_getInstanceMethod(sessionClass, @selector(setCategory:error:));
-        Method m2 = class_getInstanceMethod(sessionClass, @selector(setCategory:withOptions:error:));
-        Method m3 = class_getInstanceMethod(sessionClass, @selector(setCategory:mode:options:error:));
-
-        if (m1) { orig_setCategory1 = method_setImplementation(m1, (IMP)forced_setCategory_error); }
-        if (m2) { orig_setCategory2 = method_setImplementation(m2, (IMP)forced_setCategory_options_error); }
-        if (m3) { orig_setCategory3 = method_setImplementation(m3, (IMP)forced_setCategory_mode_options_error); }
-
-        // 2. Set it now
+        // Set audio session
         AVAudioSession *session = [AVAudioSession sharedInstance];
-        // Call the original directly to avoid our own hook
         if (orig_setCategory1) {
             ((BOOL(*)(id,SEL,AVAudioSessionCategory,NSError**))orig_setCategory1)(
                 session, @selector(setCategory:error:), AVAudioSessionCategoryPlayback, nil);
         }
         [session setActive:YES error:nil];
 
-        // 3. Disable SDL background events
+        // SDL hints
+        SDL_SetHint_t setHint = (SDL_SetHint_t)dlsym(RTLD_DEFAULT, "SDL_SetHint");
+        if (setHint) setHint("SDL_AUDIO_CATEGORY", "playback");
+
+        // Disable background events
+        SDL_SetEventEnabled_t setEvent = (SDL_SetEventEnabled_t)dlsym(RTLD_DEFAULT, "SDL_SetEventEnabled");
+        if (setEvent) { setEvent(SDL_EVENT_WILL_ENTER_BACKGROUND, 0); setEvent(SDL_EVENT_DID_ENTER_BACKGROUND, 0); }
+
+        // Post-launch setup
         [[NSNotificationCenter defaultCenter]
             addObserverForName:UIApplicationDidFinishLaunchingNotification
             object:nil queue:nil
             usingBlock:^(NSNotification *n) {
                 SDL_SetEventEnabled_t fn = (SDL_SetEventEnabled_t)dlsym(RTLD_DEFAULT, "SDL_SetEventEnabled");
                 if (fn) { fn(SDL_EVENT_WILL_ENTER_BACKGROUND, 0); fn(SDL_EVENT_DID_ENTER_BACKGROUND, 0); }
-
                 registerNowPlaying();
 
-                // Swizzle AppDelegate
                 Class appDel = [[UIApplication sharedApplication].delegate class];
                 if (appDel) {
                     Method m = class_getInstanceMethod(appDel, @selector(applicationWillResignActive:));
-                    if (m) method_setImplementation(m, imp_implementationWithBlock(^(id s, id a) {}));
+                    if (m) method_setImplementation(m, imp_implementationWithBlock(^(id s, id a) {
+                        [[AVAudioSession sharedInstance] setActive:YES error:nil];
+                    }));
                 }
-                NSLog(@"[BGAudio] Post-launch complete");
             }];
 
+        // Keep audio alive on resign/background
         [[NSNotificationCenter defaultCenter]
             addObserverForName:UIApplicationWillResignActiveNotification
             object:nil queue:nil
@@ -112,11 +137,35 @@ static void bgaudio_init(void) {
                 registerNowPlaying();
             }];
 
+        // Handle audio interruption (AirPods switch, phone call, etc.)
         [[NSNotificationCenter defaultCenter]
             addObserverForName:AVAudioSessionInterruptionNotification
             object:nil queue:nil
             usingBlock:^(NSNotification *n) {
-                [[AVAudioSession sharedInstance] setActive:YES error:nil];
+                NSUInteger type = [n.userInfo[AVAudioSessionInterruptionTypeKey] unsignedIntegerValue];
+                if (type == AVAudioSessionInterruptionTypeEnded) {
+                    NSLog(@"[BGAudio] Audio interruption ended - reactivating");
+                    reactivateAudio();
+                } else {
+                    NSLog(@"[BGAudio] Audio interruption began - will recover");
+                    // Schedule recovery in case we don't get the "ended" notification
+                    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+                        reactivateAudio();
+                    });
+                }
+            }];
+
+        // Handle audio route change (AirPods connected/disconnected/switched)
+        [[NSNotificationCenter defaultCenter]
+            addObserverForName:AVAudioSessionRouteChangeNotification
+            object:nil queue:nil
+            usingBlock:^(NSNotification *n) {
+                NSUInteger reason = [n.userInfo[AVAudioSessionRouteChangeReasonKey] unsignedIntegerValue];
+                NSLog(@"[BGAudio] Route changed, reason=%lu", (unsigned long)reason);
+                // Re-activate after a short delay to let the route settle
+                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.3 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+                    reactivateAudio();
+                });
             }];
     }
 }
