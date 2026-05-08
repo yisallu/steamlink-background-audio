@@ -162,6 +162,15 @@ static void disable_sdl_background_events(void) {
 // BGAUDIO_MIX_WITH_OTHERS=1 in the app environment before launch.
 static BOOL gAllowMixWithOthers = NO;
 
+// Set when we've yielded the audio session to another app (interruption
+// Began).  Cleared by the interruption Ended handler when iOS signals
+// ShouldResume, or by the UIApplicationWillEnterForegroundNotification /
+// DidBecomeActiveNotification observers when the user returns to Steam Link.
+// While this is YES the silent keep-alive player stays stopped and we do not
+// re-assert setActive:YES, so other apps (Douyin, Apple Music, phone calls,
+// etc.) can actually hold audio.
+static BOOL gInterrupted = NO;
+
 static void bg_init_flags(void) {
     const char *v = getenv("BGAUDIO_MIX_WITH_OTHERS");
     gAllowMixWithOthers = (v && v[0] && v[0] != '0');
@@ -405,11 +414,29 @@ static void install_reenforcement_observers(void) {
 
     [nc addObserverForName:UIApplicationWillEnterForegroundNotification
                     object:nil queue:q
-                usingBlock:^(NSNotification *n){ force_playback(@"willForeground"); }];
+                usingBlock:^(NSNotification *n){
+        if (gInterrupted) {
+            BGLOG(@"[willForeground] restoring audio after prior interruption");
+            gInterrupted = NO;
+        }
+        if (gSilencePlayer && !gSilencePlayer.isPlaying) {
+            [gSilencePlayer play];
+        }
+        force_playback(@"willForeground");
+    }];
 
     [nc addObserverForName:UIApplicationDidBecomeActiveNotification
                     object:nil queue:q
-                usingBlock:^(NSNotification *n){ force_playback(@"didBecomeActive"); }];
+                usingBlock:^(NSNotification *n){
+        if (gInterrupted) {
+            BGLOG(@"[didBecomeActive] restoring audio after prior interruption");
+            gInterrupted = NO;
+        }
+        if (gSilencePlayer && !gSilencePlayer.isPlaying) {
+            [gSilencePlayer play];
+        }
+        force_playback(@"didBecomeActive");
+    }];
 
     [nc addObserverForName:AVAudioSessionRouteChangeNotification
                     object:nil queue:q
@@ -469,11 +496,50 @@ static void install_reenforcement_observers(void) {
                     object:nil queue:q
                 usingBlock:^(NSNotification *n){
         NSNumber *type = n.userInfo[AVAudioSessionInterruptionTypeKey];
-        BGLOG(@"interruption type=%@", type);
-        // When interruption ends (type=1), re-enforce.  When it begins (type=0)
-        // iOS deactivates our session involuntarily; we reassert as soon as the
-        // run loop is clear.
-        dispatch_async(dispatch_get_main_queue(), ^{ force_playback(@"interruption"); });
+        NSNumber *opts = n.userInfo[AVAudioSessionInterruptionOptionKey];
+        BGLOG(@"interruption type=%@ opts=%@", type, opts);
+
+        if (type.integerValue == AVAudioSessionInterruptionTypeBegan) {
+            // Another app / Siri / phone call wants audio.  Actually yield it —
+            // the previous "re-assert on Began" behaviour caused Douyin,
+            // Apple Music etc. to show "another app is using audio".  Stop
+            // the silent keep-alive and bypass our setActive:NO suppressor to
+            // really release the session.
+            gInterrupted = YES;
+            if (gSilencePlayer && gSilencePlayer.isPlaying) {
+                [gSilencePlayer stop];
+                BGLOG(@"[interruption began] silent player stopped");
+            }
+            if (orig_setActive_error_) {
+                typedef BOOL (*setActive_fn)(id, SEL, BOOL, NSError **);
+                NSError *e = nil;
+                ((setActive_fn)orig_setActive_error_)(
+                    [AVAudioSession sharedInstance],
+                    @selector(setActive:error:),
+                    NO, &e);
+                BGLOG(@"[interruption began] real setActive:NO err=%@", e);
+            }
+        } else /* Ended */ {
+            BOOL shouldResume =
+                (opts.unsignedIntegerValue & AVAudioSessionInterruptionOptionShouldResume) != 0;
+            if (shouldResume) {
+                // iOS tells us to resume — this is the Siri / phone-call-ended
+                // path where the user still wants our audio back.
+                BGLOG(@"[interruption ended] ShouldResume=YES, restoring");
+                gInterrupted = NO;
+                dispatch_async(dispatch_get_main_queue(), ^{
+                    force_playback(@"interruption-ended");
+                    if (gSilencePlayer && !gSilencePlayer.isPlaying) {
+                        [gSilencePlayer play];
+                    }
+                });
+            } else {
+                // The other app is still in charge (Douyin, Apple Music, etc.).
+                // Stay quiet; the UIApplicationWillEnterForeground observer
+                // will restart audio when the user actually comes back.
+                BGLOG(@"[interruption ended] ShouldResume=NO, staying quiet");
+            }
+        }
     }];
 
     BGLOG(@"lifecycle observers installed");
