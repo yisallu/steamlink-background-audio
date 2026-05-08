@@ -1,0 +1,21 @@
+# Keep the repo minimal: source + prebuilt dylib only.
+
+# Original and patched IPAs (copyright + large binaries)
+*.ipa
+
+# Intermediate build / test scratch space
+/work/
+/dist/v*/
+/.verify/
+/.cmp/
+
+# Backups created by the patcher
+*.bak
+
+# Python
+__pycache__/
+*.pyc
+
+# OS junk
+.DS_Store
+Thumbs.db

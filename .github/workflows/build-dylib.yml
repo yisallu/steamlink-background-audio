@@ -1,0 +1,40 @@
+name: build-dylib
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Show toolchain
+        run: |
+          xcrun --sdk iphoneos --show-sdk-path
+          xcrun --sdk iphoneos clang --version
+
+      - name: Compile BackgroundAudio.dylib (arm64, iOS)
+        run: |
+          set -euxo pipefail
+          cd dylib
+          chmod +x build.sh
+          ./build.sh
+
+      - name: Sign with ad-hoc signature
+        run: |
+          set -euxo pipefail
+          cd dylib
+          codesign --force --sign - --timestamp=none BackgroundAudio.dylib
+          codesign -dv --verbose=2 BackgroundAudio.dylib || true
+          file BackgroundAudio.dylib
+          otool -L BackgroundAudio.dylib
+          otool -l BackgroundAudio.dylib | grep -A2 LC_BUILD_VERSION || true
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: BackgroundAudio-dylib
+          path: dylib/BackgroundAudio.dylib
+          if-no-files-found: error
