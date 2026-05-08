@@ -171,6 +171,12 @@ static BOOL gAllowMixWithOthers = NO;
 // etc.) can actually hold audio.
 static BOOL gInterrupted = NO;
 
+// Remembers whether the silent keep-alive player was actually running when
+// the interruption began, so we know whether to restart it on a
+// ShouldResume=YES Ended notification (restart only if we were in background
+// keep-alive mode; don't attract AirPods again if we were foreground-idle).
+static BOOL gSilentWasRunning = NO;
+
 static void bg_init_flags(void) {
     const char *v = getenv("BGAUDIO_MIX_WITH_OTHERS");
     gAllowMixWithOthers = (v && v[0] && v[0] != '0');
@@ -370,6 +376,15 @@ static void neutralize_delegate_lifecycle(void) {
 
 #pragma mark - Now Playing / remote control (keeps the system treating us as active audio)
 
+// Forward declaration — the silent-WAV builder lives further down in the file.
+static NSData *build_silent_wav(void);
+
+// We only declare Steam Link as "playing media" while the app is actually in
+// background / locked — leaving MPNowPlayingInfo with rate=1.0 in the
+// foreground-idle case is one of the signals AirPods use to auto-switch the
+// route to iPhone even when the user wanted them paired to another device.
+static BOOL gNowPlayingSeeded = NO;
+
 static void seed_now_playing(void) {
     NSMutableDictionary *info = [NSMutableDictionary dictionary];
     info[MPMediaItemPropertyTitle]  = @"Steam Link";
@@ -377,12 +392,46 @@ static void seed_now_playing(void) {
     info[MPNowPlayingInfoPropertyPlaybackRate] = @1.0;
     [MPNowPlayingInfoCenter defaultCenter].nowPlayingInfo = info;
 
-    MPRemoteCommandCenter *cc = [MPRemoteCommandCenter sharedCommandCenter];
-    cc.playCommand.enabled = YES;
-    cc.pauseCommand.enabled = YES;
-    [cc.playCommand  addTargetWithHandler:^(MPRemoteCommandEvent *e){ return MPRemoteCommandHandlerStatusSuccess; }];
-    [cc.pauseCommand addTargetWithHandler:^(MPRemoteCommandEvent *e){ return MPRemoteCommandHandlerStatusSuccess; }];
+    if (!gNowPlayingSeeded) {
+        MPRemoteCommandCenter *cc = [MPRemoteCommandCenter sharedCommandCenter];
+        cc.playCommand.enabled = YES;
+        cc.pauseCommand.enabled = YES;
+        [cc.playCommand  addTargetWithHandler:^(MPRemoteCommandEvent *e){ return MPRemoteCommandHandlerStatusSuccess; }];
+        [cc.pauseCommand addTargetWithHandler:^(MPRemoteCommandEvent *e){ return MPRemoteCommandHandlerStatusSuccess; }];
+    }
+    gNowPlayingSeeded = YES;
     BGLOG(@"MPNowPlayingInfo seeded");
+}
+
+static void clear_now_playing(void) {
+    [MPNowPlayingInfoCenter defaultCenter].nowPlayingInfo = nil;
+    BGLOG(@"MPNowPlayingInfo cleared");
+}
+
+static void start_silent_keepalive(void) {
+    if (gSilencePlayer && gSilencePlayer.isPlaying) return;
+    if (!gSilencePlayer) {
+        NSError *err = nil;
+        NSData *wav = build_silent_wav();
+        gSilencePlayer = [[AVAudioPlayer alloc] initWithData:wav error:&err];
+        if (!gSilencePlayer || err) {
+            BGLOG(@"silent player init failed: %@", err);
+            return;
+        }
+        gSilencePlayer.numberOfLoops = -1;  // infinite
+        gSilencePlayer.volume = 0.001f;     // effectively silent but not muted
+        [gSilencePlayer prepareToPlay];
+    }
+    BOOL ok = [gSilencePlayer play];
+    BGLOG(@"silent keep-alive player started: %d", ok);
+}
+
+static void stop_silent_keepalive(void) {
+    if (gSilencePlayer && gSilencePlayer.isPlaying) {
+        [gSilencePlayer stop];
+        gSilencePlayer.currentTime = 0;
+        BGLOG(@"silent keep-alive player stopped");
+    }
 }
 
 #pragma mark - Lifecycle re-enforcement
@@ -393,12 +442,21 @@ static void install_reenforcement_observers(void) {
 
     [nc addObserverForName:UIApplicationWillResignActiveNotification
                     object:nil queue:q
-                usingBlock:^(NSNotification *n){ force_playback(@"willResign"); }];
+                usingBlock:^(NSNotification *n){
+        // Going to background / lock screen.  Start the silent keep-alive
+        // and seed MPNowPlayingInfo so iOS keeps routing audio to us while
+        // the app isn't in the foreground.
+        force_playback(@"willResign");
+        start_silent_keepalive();
+        seed_now_playing();
+    }];
 
     [nc addObserverForName:UIApplicationDidEnterBackgroundNotification
                     object:nil queue:q
                 usingBlock:^(NSNotification *n){
         force_playback(@"didEnterBG");
+        start_silent_keepalive();
+        seed_now_playing();
         // Begin a background task to maximise the chance of the OS keeping
         // the process resident long enough for audio to continue.
         UIApplication *app = [UIApplication sharedApplication];
@@ -419,9 +477,6 @@ static void install_reenforcement_observers(void) {
             BGLOG(@"[willForeground] restoring audio after prior interruption");
             gInterrupted = NO;
         }
-        if (gSilencePlayer && !gSilencePlayer.isPlaying) {
-            [gSilencePlayer play];
-        }
         force_playback(@"willForeground");
     }];
 
@@ -432,9 +487,13 @@ static void install_reenforcement_observers(void) {
             BGLOG(@"[didBecomeActive] restoring audio after prior interruption");
             gInterrupted = NO;
         }
-        if (gSilencePlayer && !gSilencePlayer.isPlaying) {
-            [gSilencePlayer play];
-        }
+        // App is back in the foreground — stop advertising ourselves as a
+        // currently-playing media session.  Real audio from SDL (if the user
+        // is streaming) keeps flowing normally; AirPods smart-switching then
+        // uses actual playback to decide which device to pair with, instead
+        // of our idle-state keep-alive signals.
+        stop_silent_keepalive();
+        clear_now_playing();
         force_playback(@"didBecomeActive");
     }];
 
@@ -480,7 +539,12 @@ static void install_reenforcement_observers(void) {
 
             // Belt-and-braces: also restart the silent keep-alive player and
             // re-activate the session.
-            if (gSilencePlayer) {
+            // Belt-and-braces: if the silent keep-alive was already running
+            // (i.e. we're currently in background keep-alive mode), re-kick
+            // it so iOS re-binds to the new route.  If it wasn't running,
+            // don't start it — the app is foreground-idle and SDL's real
+            // audio (if any) handles routing on its own.
+            if (gSilencePlayer && gSilencePlayer.isPlaying) {
                 [gSilencePlayer stop];
                 gSilencePlayer.currentTime = 0;
                 BOOL ok = [gSilencePlayer play];
@@ -506,9 +570,12 @@ static void install_reenforcement_observers(void) {
             // the silent keep-alive and bypass our setActive:NO suppressor to
             // really release the session.
             gInterrupted = YES;
-            if (gSilencePlayer && gSilencePlayer.isPlaying) {
+            // Remember whether we were in background keep-alive mode so the
+            // Ended handler can restore only what it should.
+            gSilentWasRunning = (gSilencePlayer && gSilencePlayer.isPlaying);
+            if (gSilentWasRunning) {
                 [gSilencePlayer stop];
-                BGLOG(@"[interruption began] silent player stopped");
+                BGLOG(@"[interruption began] silent player stopped (was keep-alive)");
             }
             if (orig_setActive_error_) {
                 typedef BOOL (*setActive_fn)(id, SEL, BOOL, NSError **);
@@ -527,10 +594,16 @@ static void install_reenforcement_observers(void) {
                 // path where the user still wants our audio back.
                 BGLOG(@"[interruption ended] ShouldResume=YES, restoring");
                 gInterrupted = NO;
+                BOOL wasKeepAlive = gSilentWasRunning;
+                gSilentWasRunning = NO;
                 dispatch_async(dispatch_get_main_queue(), ^{
                     force_playback(@"interruption-ended");
-                    if (gSilencePlayer && !gSilencePlayer.isPlaying) {
-                        [gSilencePlayer play];
+                    // Only restart the silent keep-alive if it was active
+                    // before the interruption (i.e. we were in background
+                    // keep-alive mode).  Re-starting it in foreground would
+                    // attract AirPods smart-switching again.
+                    if (wasKeepAlive) {
+                        start_silent_keepalive();
                     }
                 });
             } else {
@@ -780,21 +853,6 @@ static NSData *build_silent_wav(void) {
     return d;
 }
 
-static void start_silent_keepalive(void) {
-    NSError *err = nil;
-    NSData *wav = build_silent_wav();
-    gSilencePlayer = [[AVAudioPlayer alloc] initWithData:wav error:&err];
-    if (!gSilencePlayer || err) {
-        BGLOG(@"silent player init failed: %@", err);
-        return;
-    }
-    gSilencePlayer.numberOfLoops = -1;  // infinite
-    gSilencePlayer.volume = 0.001f;     // effectively silent but not muted
-    [gSilencePlayer prepareToPlay];
-    BOOL ok = [gSilencePlayer play];
-    BGLOG(@"silent keep-alive player started: %d", ok);
-}
-
 #pragma mark - Entry point
 
 __attribute__((constructor))
@@ -816,9 +874,14 @@ static void BGAudio_load(void) {
         // neutralisation was redundant anyway.
         neutralize_scene_delegates();
         disable_sdl_background_events();
-        force_playback(@"load");
-        start_silent_keepalive();
-        seed_now_playing();
+        // Deliberately do NOT force_playback / start silent keep-alive / seed
+        // MPNowPlayingInfo here.  All three are strong signals to iOS that
+        // Steam Link is currently playing media, which causes AirPods smart-
+        // switching to steal the route to iPhone even when the user just has
+        // the app idle in the foreground / background and hasn't started a
+        // stream.  Instead we start them on UIApplicationWillResignActive /
+        // DidEnterBackground and stop them on DidBecomeActive, so foreground-
+        // idle Steam Link emits no "I'm actively playing" signal to AirPods.
         neutralize_delegate_lifecycle();
         install_reenforcement_observers();
         swizzle_notification_center();
@@ -830,12 +893,6 @@ static void BGAudio_load(void) {
                          queue:[NSOperationQueue mainQueue]
                     usingBlock:^(NSNotification *note) {
             neutralize_scene_delegates();
-            // Reassert the silent keep-alive after app launch, in case SDL
-            // restarted the session.
-            if (gSilencePlayer && !gSilencePlayer.isPlaying) {
-                BGLOG(@"restarting silent keep-alive after didFinishLaunching");
-                [gSilencePlayer play];
-            }
         }];
     }
 }
